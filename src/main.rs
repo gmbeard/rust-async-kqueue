@@ -6,11 +6,6 @@ use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 
-//const EV_ADD: u16 = 0x0001;
-//const EV_ONESHOT: u16 = 0x0010;
-//const EVFILT_READ: i16 = -1;
-//const EVFILT_WRITE: i16 = -2;
-
 #[link(name = "c")]
 extern "C" {
   fn kqueue() -> libc::c_int;  
@@ -56,22 +51,40 @@ struct Op {
   state: OpState
 }
 
-struct AsyncQueue<T: Handler> {
-  os_queue: libc::c_int,
-  events: std::vec::Vec<Op>,
-  handler: T
+struct QueueHandle {
+  handle: libc::c_int
 }
 
-impl<T: Handler> AsyncQueue<T> {
-  fn new(handler: T) -> Option<AsyncQueue<T>> {
+impl QueueHandle {
+  fn new() -> Option<QueueHandle> {
     match unsafe { kqueue() } {
-      fd if fd >= 0 => 
-        Some(AsyncQueue{
-          os_queue: fd, 
-          events: std::vec::Vec::new(),
-          handler: handler
-        }),
+      fd if fd >= 0 => Some(QueueHandle { handle: fd }),
       _ => None
+    }
+  }
+}
+
+impl Drop for QueueHandle {
+  fn drop(&mut self) {
+    unsafe { close(self.handle) }
+  }
+}
+
+struct AsyncQueue {
+  os_queue: QueueHandle,
+  events: std::vec::Vec<Op>
+}
+
+impl AsyncQueue {
+  fn new() -> Option<AsyncQueue> {
+    if let Some(h) = QueueHandle::new() {
+      Some(AsyncQueue {
+        os_queue: h,
+        events: std::vec::Vec::new()
+      })
+    }
+    else {
+      None
     }
   }
 
@@ -84,7 +97,7 @@ impl<T: Handler> AsyncQueue<T> {
       let ptr = Box::into_raw(op) as *mut _;
       ev.udata = ptr;
 
-      match kevent(self.os_queue, &ev as *const KEvent, 1, std::ptr::null(), 0, 
+      match kevent(self.os_queue.handle, &ev as *const KEvent, 1, std::ptr::null(), 0, 
         std::ptr::null()) {
         err if err < 0 => { 
           drop(Box::from_raw(ptr));
@@ -113,15 +126,12 @@ impl<T: Handler> AsyncQueue<T> {
     });
   }
 
-  fn run(mut self) {
-  
+  fn each_event<F: FnMut(Op, &mut AsyncQueue) -> Option<Op>>(&mut self, mut func: F) {
     loop {
-
       unsafe {
-
         let ev_buff: [KEvent; 16] = std::mem::uninitialized();
 
-        let n = kevent(self.os_queue, std::ptr::null(), 0,
+        let n = kevent(self.os_queue.handle, std::ptr::null(), 0,
           &ev_buff[0] as *const KEvent, 16, std::ptr::null());
 
         if n <= 0 {
@@ -130,29 +140,28 @@ impl<T: Handler> AsyncQueue<T> {
         
         for e in &ev_buff[..n as usize] {
           let op = Box::from_raw(e.udata as *mut () as *mut Op);
-          if let Some(next) = self.handler.handle(*op) {
+          if let Some(next) = func(*op, self) {
             self.add_op(next);
           }
         }
       }
     }
-  }
-}
 
-impl<T: Handler> Drop for AsyncQueue<T> {
-  fn drop(&mut self) {
-    unsafe { close(self.os_queue) };
+  }
+
+  fn run<H: Handler>(mut self, mut handler: H) {
+    self.each_event(|op, q| handler.handle(op, q));
   }
 }
 
 trait Handler {
-  fn handle(&mut self, op: Op) -> Option<Op>;
+  fn handle(&mut self, op: Op, queue: &mut AsyncQueue) -> Option<Op>;
 }
 
 struct MyHandler;
 
 impl Handler for MyHandler {
-  fn handle(&mut self, op: Op) -> Option<Op> {
+  fn handle(&mut self, op: Op, _: &mut AsyncQueue) -> Option<Op> {
     let next = {
       match op.state {
         OpState::Listen => {
@@ -172,7 +181,7 @@ impl Handler for MyHandler {
           loop {
             match socket.read(&mut buf[n..]) {
               Ok(read) if read > 0 => n += read,
-              Ok(read) => break,
+              Ok(_) => break,
               Err(_) => break
             }
           }
@@ -193,10 +202,10 @@ fn main() {
     let listener = TcpListener::bind("127.0.0.1:8081").unwrap();
     listener.set_nonblocking(true).unwrap();
 
-    let mut queue = AsyncQueue::new(MyHandler{}).unwrap();
+    let mut queue = AsyncQueue::new().unwrap();
 
     queue.listen_async(listener);
-    queue.run();
+    queue.run(MyHandler{});
 }
 
 #[cfg(test)]
@@ -206,9 +215,8 @@ mod tests {
 
   #[test]
   fn test_create_queue() {
-    let h = MyHandler { };
-    if let Some(AsyncQueue{ os_queue: val, .. }) = AsyncQueue::new(h) {
-      assert!(0 <= val);
+    if let Some(AsyncQueue{ os_queue: val, .. }) = AsyncQueue::new() {
+      assert!(0 <= val.handle);
     }
     else {
       panic!("No queue returned from ::new");
